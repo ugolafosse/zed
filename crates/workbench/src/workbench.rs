@@ -39,6 +39,41 @@ pub struct CollectionId(String);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceId(String);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadingPositionId(String);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadingPositionStatus {
+    Exact,
+    Relocated,
+    Stale,
+}
+
+pub struct ResolvedReadingPosition {
+    status: ReadingPositionStatus,
+    absolute_offset: usize,
+    paragraph: String,
+    offset_in_paragraph: usize,
+}
+
+impl ResolvedReadingPosition {
+    pub fn status(&self) -> ReadingPositionStatus {
+        self.status
+    }
+
+    pub fn absolute_offset(&self) -> usize {
+        self.absolute_offset
+    }
+
+    pub fn paragraph(&self) -> &str {
+        &self.paragraph
+    }
+
+    pub fn offset_in_paragraph(&self) -> usize {
+        self.offset_in_paragraph
+    }
+}
+
 pub struct CollectionSource {
     id: SourceId,
     relative_path: PathBuf,
@@ -57,6 +92,7 @@ impl CollectionSource {
 pub struct WorkbenchCollection {
     id: CollectionId,
     source: CollectionSource,
+    connection: sqlez::connection::Connection,
 }
 
 impl WorkbenchCollection {
@@ -103,6 +139,7 @@ impl WorkbenchCollection {
                 id: SourceId(source_id),
                 relative_path,
             },
+            connection,
         })
     }
 
@@ -113,6 +150,180 @@ impl WorkbenchCollection {
     pub fn source(&self) -> &CollectionSource {
         &self.source
     }
+
+    pub fn save_reading_position(
+        &mut self,
+        markdown: &str,
+        absolute_offset: usize,
+    ) -> anyhow::Result<ReadingPositionId> {
+        anyhow::ensure!(
+            absolute_offset <= markdown.len(),
+            "reading position offset exceeds Markdown length"
+        );
+        anyhow::ensure!(
+            markdown.is_char_boundary(absolute_offset),
+            "reading position offset is not a UTF-8 boundary"
+        );
+
+        let paragraphs = markdown_paragraphs(markdown);
+        let paragraph_index = paragraphs
+            .iter()
+            .position(|paragraph| {
+                absolute_offset >= paragraph.start && absolute_offset <= paragraph.end
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("reading position is not inside a Markdown paragraph")
+            })?;
+        let paragraph = &paragraphs[paragraph_index];
+        let position_id = uuid::Uuid::new_v4().to_string();
+        let previous = paragraph_index
+            .checked_sub(1)
+            .map(|index| paragraphs[index].text.clone());
+        let next = paragraphs
+            .get(paragraph_index + 1)
+            .map(|paragraph| paragraph.text.clone());
+
+        self.connection
+            .with_savepoint("save_reading_position", || {
+                self.connection.exec_bound(
+                    r#"
+                    INSERT INTO reading_positions (
+                        id,
+                        source_id,
+                        prior_absolute_offset,
+                        paragraph_snapshot,
+                        intra_paragraph_offset,
+                        previous_paragraph_snapshot,
+                        next_paragraph_snapshot,
+                        resolution_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+                )?((
+                    position_id.clone(),
+                    self.source.id.0.clone(),
+                    absolute_offset,
+                    paragraph.text.clone(),
+                    absolute_offset - paragraph.start,
+                    previous,
+                    next,
+                    "Exact",
+                ))
+            })?;
+
+        Ok(ReadingPositionId(position_id))
+    }
+
+    pub fn resolve_reading_position(
+        &self,
+        position: &ReadingPositionId,
+        markdown: &str,
+    ) -> anyhow::Result<ResolvedReadingPosition> {
+        self.connection
+            .with_savepoint("resolve_reading_position", || {
+                let (prior_absolute_offset, snapshot, saved_intra_offset) =
+                    self.connection
+                        .select_row_bound::<(String, String), (usize, String, usize)>(
+                            r#"
+                        SELECT prior_absolute_offset, paragraph_snapshot, intra_paragraph_offset
+                        FROM reading_positions
+                        WHERE id = ? AND source_id = ?
+                    "#,
+                        )?((position.0.clone(), self.source.id.0.clone()))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("reading position does not exist for this source")
+                    })?;
+
+                let matches = markdown_paragraphs(markdown)
+                    .into_iter()
+                    .filter(|paragraph| paragraph.text == snapshot)
+                    .collect::<Vec<_>>();
+                anyhow::ensure!(
+                    matches.len() == 1,
+                    "exact paragraph snapshot must match uniquely; found {} matches",
+                    matches.len()
+                );
+                let paragraph = &matches[0];
+                let offset_in_paragraph =
+                    clamp_to_utf8_boundary(&paragraph.text, saved_intra_offset);
+                let absolute_offset = paragraph.start + offset_in_paragraph;
+                let status = if absolute_offset == prior_absolute_offset {
+                    ReadingPositionStatus::Exact
+                } else {
+                    ReadingPositionStatus::Relocated
+                };
+                let durable_status = match status {
+                    ReadingPositionStatus::Exact => "Exact",
+                    ReadingPositionStatus::Relocated => "Relocated",
+                    ReadingPositionStatus::Stale => "Stale",
+                };
+                self.connection.exec_bound(
+                    "UPDATE reading_positions SET resolution_status = ? WHERE id = ?",
+                )?((durable_status, position.0.clone()))?;
+
+                Ok(ResolvedReadingPosition {
+                    status,
+                    absolute_offset,
+                    paragraph: paragraph.text.clone(),
+                    offset_in_paragraph,
+                })
+            })
+    }
+}
+
+struct MarkdownParagraph {
+    start: usize,
+    end: usize,
+    text: String,
+}
+
+fn markdown_paragraphs(markdown: &str) -> Vec<MarkdownParagraph> {
+    let mut paragraphs = Vec::new();
+    let mut paragraph_start = None;
+    let mut paragraph_end = 0;
+    let mut line_start = 0;
+
+    for line in markdown.split_inclusive('\n') {
+        let line_end = line_start + line.len();
+        let content_end = line
+            .strip_suffix('\n')
+            .unwrap_or(line)
+            .strip_suffix('\r')
+            .map_or(line_end - usize::from(line.ends_with('\n')), |content| {
+                line_start + content.len()
+            });
+        let is_blank = markdown[line_start..content_end].trim().is_empty();
+        if is_blank {
+            if let Some(start) = paragraph_start.take() {
+                paragraphs.push(MarkdownParagraph {
+                    start,
+                    end: paragraph_end,
+                    text: markdown[start..paragraph_end].to_string(),
+                });
+            }
+        } else {
+            paragraph_start.get_or_insert(line_start);
+            paragraph_end = content_end;
+        }
+        line_start = line_end;
+    }
+
+    if let Some(start) = paragraph_start {
+        paragraphs.push(MarkdownParagraph {
+            start,
+            end: paragraph_end,
+            text: markdown[start..paragraph_end].to_string(),
+        });
+    }
+
+    paragraphs
+}
+
+fn clamp_to_utf8_boundary(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
 }
 
 fn open_collection_metadata(
@@ -142,6 +353,21 @@ fn open_collection_metadata(
                     relative_path TEXT NOT NULL UNIQUE
                 );
                 PRAGMA user_version = 2;
+            "#,
+            r#"
+                CREATE TABLE reading_positions (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL REFERENCES sources(id),
+                    prior_absolute_offset INTEGER NOT NULL,
+                    paragraph_snapshot TEXT NOT NULL,
+                    intra_paragraph_offset INTEGER NOT NULL,
+                    previous_paragraph_snapshot TEXT,
+                    next_paragraph_snapshot TEXT,
+                    resolution_status TEXT NOT NULL CHECK (
+                        resolution_status IN ('Exact', 'Relocated', 'Stale')
+                    )
+                );
+                PRAGMA user_version = 3;
             "#,
         ],
         &mut |_, _, _| false,
@@ -507,5 +733,50 @@ mod tests {
             relocated.source().relative_path(),
             std::path::Path::new("source.md")
         );
+    }
+
+    #[test]
+    fn reading_position_relocates_with_its_paragraph_after_external_edits() {
+        let collection_root = tempfile::tempdir().expect("temporary Collection should be created");
+        let source = collection_root.path().join("source.md");
+        let target = "A distinctive paragraph carries durable attention.";
+        let original_markdown =
+            format!("# Source\n\nOpening paragraph.\n\n{target}\n\nEnding paragraph.");
+        std::fs::write(&source, &original_markdown).expect("source Markdown should be written");
+        let offset_in_paragraph = 16;
+        let original_offset = original_markdown
+            .find(target)
+            .expect("target paragraph should exist")
+            + offset_in_paragraph;
+
+        let mut collection = super::WorkbenchCollection::open(collection_root.path())
+            .expect("portable Collection should open");
+        let position = collection
+            .save_reading_position(&original_markdown, original_offset)
+            .expect("reading position should be saved");
+        drop(collection);
+
+        let relocated_markdown = format!(
+            "# Inserted material\n\nFirst external paragraph.\n\nSecond external paragraph.\n\n{original_markdown}"
+        );
+        std::fs::write(&source, &relocated_markdown)
+            .expect("external Markdown edit should be written");
+        let collection = super::WorkbenchCollection::open(collection_root.path())
+            .expect("Collection should reopen after an external edit");
+        let resolved = collection
+            .resolve_reading_position(&position, &relocated_markdown)
+            .expect("saved reading position should resolve");
+
+        assert_eq!(resolved.status(), super::ReadingPositionStatus::Relocated);
+        assert_eq!(resolved.paragraph(), target);
+        assert_eq!(resolved.offset_in_paragraph(), offset_in_paragraph);
+        assert_eq!(
+            resolved.absolute_offset(),
+            relocated_markdown
+                .find(target)
+                .expect("target paragraph should remain")
+                + offset_in_paragraph
+        );
+        assert_ne!(resolved.absolute_offset(), original_offset);
     }
 }
