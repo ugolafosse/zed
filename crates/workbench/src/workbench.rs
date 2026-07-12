@@ -209,7 +209,14 @@ impl WorkbenchCollection {
                     next,
                     "Exact",
                     markdown.len(),
-                ))
+                ))?;
+                self.connection.exec_bound(
+                    r#"
+                        INSERT INTO current_reading_positions (source_id, position_id)
+                        VALUES (?, ?)
+                        ON CONFLICT(source_id) DO UPDATE SET position_id = excluded.position_id
+                    "#,
+                )?((self.source.id.0.clone(), position_id.clone()))
             })?;
 
         Ok(ReadingPositionId(position_id))
@@ -344,6 +351,34 @@ impl WorkbenchCollection {
                     offset_in_paragraph,
                 })
             })
+    }
+
+    pub fn resolve_current_reading_position(
+        &self,
+        markdown: &str,
+    ) -> anyhow::Result<Option<ResolvedReadingPosition>> {
+        let position_id = self.connection.select_row_bound::<String, String>(
+            "SELECT position_id FROM current_reading_positions WHERE source_id = ?",
+        )?(self.source.id.0.clone())?;
+        let Some(position_id) = position_id else {
+            return Ok(None);
+        };
+
+        let target_exists = self.connection.select_row_bound::<(String, String), bool>(
+            r#"
+                    SELECT EXISTS (
+                        SELECT 1 FROM reading_positions WHERE id = ? AND source_id = ?
+                    )
+                "#,
+        )?((position_id.clone(), self.source.id.0.clone()))?
+        .unwrap_or(false);
+        anyhow::ensure!(
+            target_exists,
+            "current reading position points to missing position {position_id}"
+        );
+
+        self.resolve_reading_position(&ReadingPositionId(position_id), markdown)
+            .map(Some)
     }
 }
 
@@ -536,6 +571,13 @@ fn open_collection_metadata(
                 UPDATE reading_positions
                     SET prior_document_length = MAX(prior_absolute_offset + 1, 1);
                 PRAGMA user_version = 4;
+            "#,
+            r#"
+                CREATE TABLE current_reading_positions (
+                    source_id TEXT PRIMARY KEY REFERENCES sources(id),
+                    position_id TEXT NOT NULL UNIQUE REFERENCES reading_positions(id)
+                );
+                PRAGMA user_version = 5;
             "#,
         ],
         &mut |_, _, _| false,
@@ -1096,5 +1138,38 @@ mod tests {
         assert_eq!(resolved.paragraph(), "Café");
         assert_eq!(resolved.offset_in_paragraph(), "Café".len());
         assert_ne!(resolved.paragraph(), deleted_paragraph);
+    }
+
+    #[test]
+    fn current_reading_position_restores_without_a_session_held_id() {
+        let collection_root = tempfile::tempdir().expect("temporary Collection should be created");
+        let source = collection_root.path().join("source.md");
+        let target = "A durable paragraph restores without UI session identity.";
+        let markdown = format!("# Source\n\nOpening context.\n\n{target}\n\nEnding context.");
+        std::fs::write(&source, &markdown).expect("source Markdown should be written");
+        let offset_in_paragraph = 10;
+        let absolute_offset = markdown
+            .find(target)
+            .expect("target paragraph should exist")
+            + offset_in_paragraph;
+
+        let mut collection = super::WorkbenchCollection::open(collection_root.path())
+            .expect("portable Collection should open");
+        collection
+            .save_reading_position(&markdown, absolute_offset)
+            .expect("current reading position should be saved");
+        drop(collection);
+
+        let collection = super::WorkbenchCollection::open(collection_root.path())
+            .expect("Collection should reopen without UI session state");
+        let resolved = collection
+            .resolve_current_reading_position(&markdown)
+            .expect("durable current position should resolve")
+            .expect("a saved current position should exist");
+
+        assert_eq!(resolved.status(), super::ReadingPositionStatus::Exact);
+        assert_eq!(resolved.paragraph(), target);
+        assert_eq!(resolved.offset_in_paragraph(), offset_in_paragraph);
+        assert_eq!(resolved.absolute_offset(), absolute_offset);
     }
 }
