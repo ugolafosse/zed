@@ -262,17 +262,40 @@ impl WorkbenchCollection {
                         .checked_sub(saved_intra_offset)
                         .ok_or_else(|| anyhow::anyhow!("saved reading position is inconsistent"))?;
                 let paragraphs = markdown_paragraphs(markdown);
+                let has_exact_match = paragraphs
+                    .iter()
+                    .any(|paragraph| paragraph.text == snapshot);
                 let mut matches = paragraphs
                     .iter()
                     .enumerate()
-                    .filter(|(_, paragraph)| paragraph.text == snapshot)
+                    .filter(|(_, paragraph)| {
+                        if has_exact_match {
+                            paragraph.text == snapshot
+                        } else {
+                            normalized_whitespace_equal(&paragraph.text, &snapshot)
+                        }
+                    })
                     .map(|(index, paragraph)| {
                         let previous = index
                             .checked_sub(1)
                             .map(|previous_index| paragraphs[previous_index].text.as_str());
                         let next = paragraphs.get(index + 1).map(|next| next.text.as_str());
-                        let context_score = usize::from(previous == saved_previous.as_deref())
-                            + usize::from(next == saved_next.as_deref());
+                        let context_matches = |current: Option<&str>, saved: Option<&str>| {
+                            if has_exact_match {
+                                current == saved
+                            } else {
+                                match (current, saved) {
+                                    (Some(current), Some(saved)) => {
+                                        normalized_whitespace_equal(current, saved)
+                                    }
+                                    (None, None) => true,
+                                    _ => false,
+                                }
+                            }
+                        };
+                        let context_score =
+                            usize::from(context_matches(previous, saved_previous.as_deref()))
+                                + usize::from(context_matches(next, saved_next.as_deref()));
                         let proportional_distance = (paragraph.start as u128
                             * prior_document_length as u128)
                             .abs_diff(prior_paragraph_start as u128 * markdown.len() as u128);
@@ -281,7 +304,7 @@ impl WorkbenchCollection {
                     .collect::<Vec<_>>();
                 anyhow::ensure!(
                     !matches.is_empty(),
-                    "exact paragraph snapshot was not found"
+                    "paragraph snapshot was not found by exact or normalized-whitespace matching"
                 );
                 matches.sort_by_key(|(paragraph, context_score, proportional_distance)| {
                     (
@@ -291,10 +314,13 @@ impl WorkbenchCollection {
                     )
                 });
                 let paragraph = matches[0].0;
-                let offset_in_paragraph =
-                    clamp_to_utf8_boundary(&paragraph.text, saved_intra_offset);
+                let offset_in_paragraph = if has_exact_match {
+                    clamp_to_utf8_boundary(&paragraph.text, saved_intra_offset)
+                } else {
+                    map_normalized_intra_offset(&snapshot, &paragraph.text, saved_intra_offset)?
+                };
                 let absolute_offset = paragraph.start + offset_in_paragraph;
-                let status = if absolute_offset == prior_absolute_offset {
+                let status = if has_exact_match && absolute_offset == prior_absolute_offset {
                     ReadingPositionStatus::Exact
                 } else {
                     ReadingPositionStatus::Relocated
@@ -372,6 +398,62 @@ fn clamp_to_utf8_boundary(text: &str, offset: usize) -> usize {
         offset -= 1;
     }
     offset
+}
+
+fn normalized_whitespace_equal(left: &str, right: &str) -> bool {
+    left.split_whitespace().eq(right.split_whitespace())
+}
+
+fn token_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut token_start = None;
+    for (offset, character) in text.char_indices() {
+        if character.is_whitespace() {
+            if let Some(start) = token_start.take() {
+                spans.push((start, offset));
+            }
+        } else {
+            token_start.get_or_insert(offset);
+        }
+    }
+    if let Some(start) = token_start {
+        spans.push((start, text.len()));
+    }
+    spans
+}
+
+fn map_normalized_intra_offset(
+    saved: &str,
+    current: &str,
+    saved_offset: usize,
+) -> anyhow::Result<usize> {
+    let saved_offset = clamp_to_utf8_boundary(saved, saved_offset);
+    let saved_tokens = token_spans(saved);
+    let current_tokens = token_spans(current);
+    anyhow::ensure!(
+        saved_tokens.len() == current_tokens.len(),
+        "normalized paragraph token counts differ"
+    );
+
+    if let Some((token_index, (saved_start, _))) = saved_tokens
+        .iter()
+        .enumerate()
+        .find(|(_, (start, end))| saved_offset >= *start && saved_offset < *end)
+    {
+        let character_offset = saved[*saved_start..saved_offset].chars().count();
+        let (current_start, current_end) = current_tokens[token_index];
+        let within_current = current[current_start..current_end]
+            .char_indices()
+            .nth(character_offset)
+            .map_or(current_end - current_start, |(offset, _)| offset);
+        return Ok(current_start + within_current);
+    }
+
+    Ok(saved_tokens
+        .iter()
+        .enumerate()
+        .find(|(_, (start, _))| *start >= saved_offset)
+        .map_or(current.len(), |(index, _)| current_tokens[index].0))
 }
 
 fn open_collection_metadata(
@@ -886,6 +968,61 @@ mod tests {
         assert_ne!(
             resolved.absolute_offset(),
             first_duplicate + offset_in_paragraph
+        );
+    }
+
+    #[test]
+    fn reading_position_relocates_across_normalized_whitespace_reflow() {
+        let collection_root = tempfile::tempdir().expect("temporary Collection should be created");
+        let source = collection_root.path().join("source.md");
+        let distinctive_word = "mnemonic";
+        let original_paragraph =
+            "Learning   requires\tcareful attention to mnemonic structure in durable material.";
+        let reflowed_paragraph =
+            "Learning requires\ncareful   attention to\tmnemonic structure in durable material.";
+        assert_ne!(original_paragraph, reflowed_paragraph);
+        assert_eq!(
+            original_paragraph.split_whitespace().collect::<Vec<_>>(),
+            reflowed_paragraph.split_whitespace().collect::<Vec<_>>()
+        );
+
+        let original_markdown =
+            format!("# Source\n\nOpening context.\n\n{original_paragraph}\n\nEnding context.");
+        std::fs::write(&source, &original_markdown).expect("source Markdown should be written");
+        let original_offset = original_markdown
+            .find(distinctive_word)
+            .expect("distinctive word should exist");
+        let mut collection = super::WorkbenchCollection::open(collection_root.path())
+            .expect("portable Collection should open");
+        let position = collection
+            .save_reading_position(&original_markdown, original_offset)
+            .expect("position at the distinctive word should be saved");
+        drop(collection);
+
+        let relocated_markdown = format!(
+            "# Inserted material\n\nA new preceding paragraph.\n\n# Source\n\nOpening context.\n\n{reflowed_paragraph}\n\nEnding context."
+        );
+        std::fs::write(&source, &relocated_markdown)
+            .expect("externally reflowed Markdown should be written");
+        let expected_absolute_offset = relocated_markdown
+            .find(distinctive_word)
+            .expect("distinctive word should remain after reflow");
+        let expected_paragraph_start = relocated_markdown
+            .find(reflowed_paragraph)
+            .expect("reflowed paragraph should exist");
+
+        let collection = super::WorkbenchCollection::open(collection_root.path())
+            .expect("Collection should reopen after reflow");
+        let resolved = collection
+            .resolve_reading_position(&position, &relocated_markdown)
+            .expect("normalized whitespace should preserve the semantic position");
+
+        assert_eq!(resolved.status(), super::ReadingPositionStatus::Relocated);
+        assert_eq!(resolved.paragraph(), reflowed_paragraph);
+        assert_eq!(resolved.absolute_offset(), expected_absolute_offset);
+        assert_eq!(
+            resolved.offset_in_paragraph(),
+            expected_absolute_offset - expected_paragraph_start
         );
     }
 }
