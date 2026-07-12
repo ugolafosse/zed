@@ -195,8 +195,9 @@ impl WorkbenchCollection {
                         intra_paragraph_offset,
                         previous_paragraph_snapshot,
                         next_paragraph_snapshot,
-                        resolution_status
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        resolution_status,
+                        prior_document_length
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
                 )?((
                     position_id.clone(),
@@ -207,6 +208,7 @@ impl WorkbenchCollection {
                     previous,
                     next,
                     "Exact",
+                    markdown.len(),
                 ))
             })?;
 
@@ -220,29 +222,75 @@ impl WorkbenchCollection {
     ) -> anyhow::Result<ResolvedReadingPosition> {
         self.connection
             .with_savepoint("resolve_reading_position", || {
-                let (prior_absolute_offset, snapshot, saved_intra_offset) =
-                    self.connection
-                        .select_row_bound::<(String, String), (usize, String, usize)>(
-                            r#"
-                        SELECT prior_absolute_offset, paragraph_snapshot, intra_paragraph_offset
+                let (
+                    prior_absolute_offset,
+                    snapshot,
+                    saved_intra_offset,
+                    saved_previous,
+                    saved_next,
+                    prior_document_length,
+                ) = self.connection.select_row_bound::<(String, String), (
+                    usize,
+                    String,
+                    usize,
+                    Option<String>,
+                    Option<String>,
+                    usize,
+                )>(
+                    r#"
+                        SELECT
+                            prior_absolute_offset,
+                            paragraph_snapshot,
+                            intra_paragraph_offset,
+                            previous_paragraph_snapshot,
+                            next_paragraph_snapshot,
+                            prior_document_length
                         FROM reading_positions
                         WHERE id = ? AND source_id = ?
                     "#,
-                        )?((position.0.clone(), self.source.id.0.clone()))?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("reading position does not exist for this source")
-                    })?;
+                )?((position.0.clone(), self.source.id.0.clone()))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("reading position does not exist for this source")
+                })?;
 
-                let matches = markdown_paragraphs(markdown)
-                    .into_iter()
-                    .filter(|paragraph| paragraph.text == snapshot)
+                anyhow::ensure!(
+                    prior_document_length > 0,
+                    "saved reading position has an invalid prior document length"
+                );
+                let prior_paragraph_start =
+                    prior_absolute_offset
+                        .checked_sub(saved_intra_offset)
+                        .ok_or_else(|| anyhow::anyhow!("saved reading position is inconsistent"))?;
+                let paragraphs = markdown_paragraphs(markdown);
+                let mut matches = paragraphs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, paragraph)| paragraph.text == snapshot)
+                    .map(|(index, paragraph)| {
+                        let previous = index
+                            .checked_sub(1)
+                            .map(|previous_index| paragraphs[previous_index].text.as_str());
+                        let next = paragraphs.get(index + 1).map(|next| next.text.as_str());
+                        let context_score = usize::from(previous == saved_previous.as_deref())
+                            + usize::from(next == saved_next.as_deref());
+                        let proportional_distance = (paragraph.start as u128
+                            * prior_document_length as u128)
+                            .abs_diff(prior_paragraph_start as u128 * markdown.len() as u128);
+                        (paragraph, context_score, proportional_distance)
+                    })
                     .collect::<Vec<_>>();
                 anyhow::ensure!(
-                    matches.len() == 1,
-                    "exact paragraph snapshot must match uniquely; found {} matches",
-                    matches.len()
+                    !matches.is_empty(),
+                    "exact paragraph snapshot was not found"
                 );
-                let paragraph = &matches[0];
+                matches.sort_by_key(|(paragraph, context_score, proportional_distance)| {
+                    (
+                        std::cmp::Reverse(*context_score),
+                        *proportional_distance,
+                        paragraph.start,
+                    )
+                });
+                let paragraph = matches[0].0;
                 let offset_in_paragraph =
                     clamp_to_utf8_boundary(&paragraph.text, saved_intra_offset);
                 let absolute_offset = paragraph.start + offset_in_paragraph;
@@ -368,6 +416,13 @@ fn open_collection_metadata(
                     )
                 );
                 PRAGMA user_version = 3;
+            "#,
+            r#"
+                ALTER TABLE reading_positions
+                    ADD COLUMN prior_document_length INTEGER NOT NULL DEFAULT 1;
+                UPDATE reading_positions
+                    SET prior_document_length = MAX(prior_absolute_offset + 1, 1);
+                PRAGMA user_version = 4;
             "#,
         ],
         &mut |_, _, _| false,
@@ -778,5 +833,59 @@ mod tests {
                 + offset_in_paragraph
         );
         assert_ne!(resolved.absolute_offset(), original_offset);
+    }
+
+    #[test]
+    fn reading_position_relocates_to_the_intended_duplicate_paragraph() {
+        let collection_root = tempfile::tempdir().expect("temporary Collection should be created");
+        let source = collection_root.path().join("source.md");
+        let target = "Repeated paragraph with the same visible text.";
+        let original_markdown = format!(
+            "# Source\n\nContext before the first copy.\n\n{target}\n\nContext after the first copy.\n\nBridge paragraph.\n\nContext before the intended copy.\n\n{target}\n\nContext after the intended copy."
+        );
+        std::fs::write(&source, &original_markdown).expect("source Markdown should be written");
+        let offset_in_paragraph = 9;
+        let intended_original_offset = original_markdown
+            .rfind(target)
+            .expect("intended duplicate should exist")
+            + offset_in_paragraph;
+
+        let mut collection = super::WorkbenchCollection::open(collection_root.path())
+            .expect("portable Collection should open");
+        let position = collection
+            .save_reading_position(&original_markdown, intended_original_offset)
+            .expect("position inside the intended duplicate should be saved");
+        drop(collection);
+
+        let relocated_markdown = format!(
+            "# Externally inserted material\n\nAnother preceding paragraph.\n\n{original_markdown}"
+        );
+        std::fs::write(&source, &relocated_markdown)
+            .expect("external Markdown edit should be written");
+        let first_duplicate = relocated_markdown
+            .find(target)
+            .expect("first duplicate should remain");
+        let intended_duplicate = relocated_markdown
+            .rfind(target)
+            .expect("intended duplicate should remain");
+        assert_ne!(first_duplicate, intended_duplicate);
+
+        let collection = super::WorkbenchCollection::open(collection_root.path())
+            .expect("Collection should reopen after external edits");
+        let resolved = collection
+            .resolve_reading_position(&position, &relocated_markdown)
+            .expect("context should resolve the intended duplicate deterministically");
+
+        assert_eq!(resolved.status(), super::ReadingPositionStatus::Relocated);
+        assert_eq!(resolved.paragraph(), target);
+        assert_eq!(resolved.offset_in_paragraph(), offset_in_paragraph);
+        assert_eq!(
+            resolved.absolute_offset(),
+            intended_duplicate + offset_in_paragraph
+        );
+        assert_ne!(
+            resolved.absolute_offset(),
+            first_duplicate + offset_in_paragraph
+        );
     }
 }
