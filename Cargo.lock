@@ -22521,7 +22521,6 @@ dependencies = [
  "assets",
  "editor",
  "gpui",
- "gpui_platform",
  "language",
  "release_channel",
  "semver",
@@ -22530,7 +22529,6 @@ dependencies = [
  "theme",
  "theme_settings",
  "vim",
- "vim_mode_setting",
 ]
 
 [[package]]
@@ -23190,6 +23188,7 @@ dependencies = [
  "which_key",
  "windows 0.61.3",
  "windows_resources",
+ "workbench",
  "workspace",
  "zed-reqwest",
  "zed_actions",

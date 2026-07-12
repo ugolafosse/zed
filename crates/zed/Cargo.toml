@@ -221,6 +221,7 @@ watch.workspace = true
 web_search.workspace = true
 web_search_providers.workspace = true
 which_key.workspace = true
+workbench.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
 zed_env_vars.workspace = true

@@ -30,7 +30,8 @@ use futures::{StreamExt, channel::oneshot, future};
 use git::GitHostingProviderRegistry;
 use git_ui::clone::clone_and_open;
 use gpui::{
-    App, AppContext, Application, AsyncApp, QuitMode, Task, TaskExt, UpdateGlobal as _, block_on,
+    App, AppContext, Application, AsyncApp, QuitMode, ReadGlobal as _, Task, TaskExt,
+    UpdateGlobal as _, block_on,
 };
 use gpui_platform;
 
@@ -89,6 +90,24 @@ fn build_application() -> Application {
         Application::with_platform(platform)
     } else {
         Application::new_inaccessible(platform)
+    }
+}
+
+struct ZedWorkbenchHost {
+    open_listener: OpenListener,
+}
+
+impl workbench::WorkbenchHost for ZedWorkbenchHost {
+    fn open_collection(&self, request: workbench::OpenCollectionRequest) {
+        let urls = [request.collection_root, request.source]
+            .into_iter()
+            .filter_map(|path| url::Url::from_file_path(path).ok())
+            .map(|url| url.to_string())
+            .collect();
+        self.open_listener.open(RawOpenRequest {
+            urls,
+            ..Default::default()
+        });
     }
 }
 
@@ -758,6 +777,12 @@ fn main() {
             wrap_div_with_search_actions: search::buffer_search::register_pane_search_actions,
         });
         vim::init(cx);
+        workbench::init_workbench_capability(
+            Rc::new(ZedWorkbenchHost {
+                open_listener: OpenListener::global(cx).clone(),
+            }),
+            cx,
+        );
         terminal_view::init(cx);
         journal::init(app_state.clone(), cx);
         encoding_selector::init(cx);

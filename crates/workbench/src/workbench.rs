@@ -1,26 +1,78 @@
-use std::path::{Component, PathBuf};
 #[cfg(test)]
-use std::{cell::Cell, rc::Rc};
+use std::cell::Cell;
+#[cfg(test)]
+use std::path::Component;
+use std::path::PathBuf;
+use std::rc::Rc;
 
-use anyhow::Result;
-use anyhow::bail;
+#[cfg(test)]
+use anyhow::{Result, bail};
+#[cfg(test)]
 use assets::Assets;
+#[cfg(test)]
 use editor::Editor;
 #[cfg(test)]
 use gpui::{AnyWindowHandle, Entity, TestAppContext};
-use gpui::{App, AppContext as _, Focusable as _, UpdateGlobal as _, WindowOptions};
+use gpui::{App, PathPromptOptions};
+#[cfg(test)]
+use gpui::{AppContext as _, Focusable as _, UpdateGlobal as _};
+#[cfg(test)]
 use settings::{KeybindSource, SettingsStore};
 
+gpui::actions!(workbench, [OpenCollection]);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenCollectionRequest {
+    pub collection_root: PathBuf,
+    pub source: PathBuf,
+}
+
+pub trait WorkbenchHost {
+    fn open_collection(&self, request: OpenCollectionRequest);
+}
+
+pub fn init_workbench_capability(host: Rc<dyn WorkbenchHost>, cx: &mut App) {
+    cx.on_action(move |_: &OpenCollection, cx| {
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open Collection".into()),
+        });
+        let host = host.clone();
+        cx.spawn(async move |_cx| {
+            let Ok(Ok(Some(paths))) = prompt.await else {
+                return;
+            };
+            let Some(collection_root) = paths.into_iter().next() else {
+                return;
+            };
+            let source = collection_root.join("source.md");
+            if !collection_root.is_dir() || !source.is_file() {
+                return;
+            }
+            host.open_collection(OpenCollectionRequest {
+                collection_root,
+                source,
+            });
+        })
+        .detach();
+    });
+}
+
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkbenchMode {
     Normal,
     Insert,
 }
 
+#[cfg(test)]
 pub struct WorkbenchLaunch {
     markdown: String,
 }
 
+#[cfg(test)]
 impl WorkbenchLaunch {
     pub fn from_cli_arguments<I, S>(arguments: I) -> anyhow::Result<Self>
     where
@@ -64,34 +116,14 @@ impl WorkbenchLaunch {
         })
     }
 
-    #[cfg(test)]
     pub async fn launch_for_test(self, cx: &mut TestAppContext) -> Result<WorkbenchTestSession> {
         WorkbenchTestSession::launch(&self.markdown, cx).await
     }
-
-    pub fn run(self) {
-        gpui_platform::application()
-            .with_assets(Assets)
-            .run(move |cx| {
-                initialize(cx, true).expect("Workbench application should initialize");
-                cx.activate(true);
-                let buffer = cx.new(|cx| language::Buffer::local(self.markdown, cx));
-                cx.open_window(WindowOptions::default(), |window, cx| {
-                    let editor = cx.new(|cx| Editor::for_buffer(buffer, None, window, cx));
-                    editor.update(cx, |editor, cx| window.focus(&editor.focus_handle(cx), cx));
-                    editor
-                })
-                .expect("Workbench editor window should open");
-            });
-    }
 }
 
-fn initialize(cx: &mut App, load_application_fonts: bool) -> Result<()> {
-    if load_application_fonts {
-        Assets.load_fonts(cx)?;
-    } else {
-        Assets.load_test_fonts(cx);
-    }
+#[cfg(test)]
+fn initialize(cx: &mut App) -> Result<()> {
+    Assets.load_test_fonts(cx);
     settings::init(cx);
     theme_settings::init(theme::LoadThemes::JustBase, cx);
     release_channel::init(semver::Version::new(0, 0, 0), cx);
@@ -131,7 +163,7 @@ impl WorkbenchTestSession {
     pub async fn launch(markdown: &str, cx: &mut TestAppContext) -> Result<Self> {
         let mode = Rc::new(Cell::new(WorkbenchMode::Normal));
         cx.update(|cx| {
-            initialize(cx, false)?;
+            initialize(cx)?;
 
             let insert_mode = mode.clone();
             cx.on_action(move |_: &vim::SwitchToInsertMode, _| {
@@ -215,5 +247,55 @@ mod tests {
 
         assert_eq!(session.active_text(cx), "# Source\n");
         assert_eq!(session.active_mode(cx), WorkbenchMode::Normal);
+    }
+
+    #[gpui::test]
+    async fn open_collection_action_requests_the_selected_collection_from_the_host(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::{cell::RefCell, rc::Rc};
+
+        struct RecordingHost {
+            request: RefCell<Option<super::OpenCollectionRequest>>,
+        }
+
+        impl super::WorkbenchHost for RecordingHost {
+            fn open_collection(&self, request: super::OpenCollectionRequest) {
+                self.request.replace(Some(request));
+            }
+        }
+
+        let collection = tempfile::tempdir().expect("temporary Collection should be created");
+        std::fs::write(collection.path().join("source.md"), "# Source")
+            .expect("Collection source should be written");
+        let host = Rc::new(RecordingHost {
+            request: RefCell::new(None),
+        });
+
+        cx.update(|cx| super::init_workbench_capability(host.clone(), cx));
+        cx.update(|cx| cx.dispatch_action(&super::OpenCollection));
+
+        assert!(
+            cx.did_prompt_for_paths(),
+            "Open Collection should present the native directory picker"
+        );
+        cx.simulate_path_prompt_response({
+            let selected = collection.path().to_path_buf();
+            move |options| {
+                assert!(options.directories);
+                assert!(!options.files);
+                assert!(!options.multiple);
+                Some(vec![selected])
+            }
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            host.request.borrow().as_ref(),
+            Some(&super::OpenCollectionRequest {
+                collection_root: collection.path().to_path_buf(),
+                source: collection.path().join("source.md"),
+            })
+        );
     }
 }
