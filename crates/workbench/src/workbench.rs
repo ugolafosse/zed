@@ -302,10 +302,13 @@ impl WorkbenchCollection {
                         (paragraph, context_score, proportional_distance)
                     })
                     .collect::<Vec<_>>();
-                anyhow::ensure!(
-                    !matches.is_empty(),
-                    "paragraph snapshot was not found by exact or normalized-whitespace matching"
-                );
+                if matches.is_empty() {
+                    let resolved = stale_reading_position(markdown, prior_absolute_offset);
+                    self.connection.exec_bound(
+                        "UPDATE reading_positions SET resolution_status = 'Stale' WHERE id = ?",
+                    )?(position.0.clone())?;
+                    return Ok(resolved);
+                }
                 matches.sort_by_key(|(paragraph, context_score, proportional_distance)| {
                     (
                         std::cmp::Reverse(*context_score),
@@ -398,6 +401,34 @@ fn clamp_to_utf8_boundary(text: &str, offset: usize) -> usize {
         offset -= 1;
     }
     offset
+}
+
+fn stale_reading_position(markdown: &str, prior_absolute_offset: usize) -> ResolvedReadingPosition {
+    let fallback_offset = clamp_to_utf8_boundary(markdown, prior_absolute_offset);
+    let paragraphs = markdown_paragraphs(markdown);
+    let Some(paragraph) = paragraphs.iter().min_by_key(|paragraph| {
+        let distance = if fallback_offset < paragraph.start {
+            paragraph.start - fallback_offset
+        } else {
+            fallback_offset.saturating_sub(paragraph.end)
+        };
+        (distance, paragraph.start)
+    }) else {
+        return ResolvedReadingPosition {
+            status: ReadingPositionStatus::Stale,
+            absolute_offset: fallback_offset,
+            paragraph: String::new(),
+            offset_in_paragraph: 0,
+        };
+    };
+
+    let absolute_offset = fallback_offset.clamp(paragraph.start, paragraph.end);
+    ResolvedReadingPosition {
+        status: ReadingPositionStatus::Stale,
+        absolute_offset,
+        paragraph: paragraph.text.clone(),
+        offset_in_paragraph: absolute_offset - paragraph.start,
+    }
 }
 
 fn normalized_whitespace_equal(left: &str, right: &str) -> bool {
@@ -1024,5 +1055,46 @@ mod tests {
             resolved.offset_in_paragraph(),
             expected_absolute_offset - expected_paragraph_start
         );
+    }
+
+    #[test]
+    fn missing_paragraph_resolves_to_an_explicit_stale_fallback() {
+        let collection_root = tempfile::tempdir().expect("temporary Collection should be created");
+        let source = collection_root.path().join("source.md");
+        let deleted_paragraph =
+            "This late paragraph will be completely removed from the external rewrite.";
+        let original_markdown = format!(
+            "# Original source\n\nSeveral earlier paragraphs make this document long.\n\nAnother substantial paragraph precedes the target.\n\n{deleted_paragraph}"
+        );
+        std::fs::write(&source, &original_markdown).expect("source Markdown should be written");
+        let original_offset = original_markdown
+            .find("completely")
+            .expect("position word should exist");
+        let mut collection = super::WorkbenchCollection::open(collection_root.path())
+            .expect("portable Collection should open");
+        let position = collection
+            .save_reading_position(&original_markdown, original_offset)
+            .expect("late reading position should be saved");
+        drop(collection);
+
+        let unrelated_markdown = "# New\n\nCafé";
+        assert!(original_offset > unrelated_markdown.len());
+        assert!(unrelated_markdown.is_char_boundary(unrelated_markdown.len()));
+        std::fs::write(&source, unrelated_markdown)
+            .expect("unrelated replacement Markdown should be written");
+        let collection = super::WorkbenchCollection::open(collection_root.path())
+            .expect("Collection should reopen after replacement");
+        let resolved = collection
+            .resolve_reading_position(&position, unrelated_markdown)
+            .expect("missing paragraph should produce a usable stale fallback");
+
+        assert_eq!(resolved.status(), super::ReadingPositionStatus::Stale);
+        assert_ne!(resolved.status(), super::ReadingPositionStatus::Exact);
+        assert_ne!(resolved.status(), super::ReadingPositionStatus::Relocated);
+        assert_eq!(resolved.absolute_offset(), unrelated_markdown.len());
+        assert!(unrelated_markdown.is_char_boundary(resolved.absolute_offset()));
+        assert_eq!(resolved.paragraph(), "Café");
+        assert_eq!(resolved.offset_in_paragraph(), "Café".len());
+        assert_ne!(resolved.paragraph(), deleted_paragraph);
     }
 }
