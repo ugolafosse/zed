@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod reliability;
+mod workbench_lifecycle;
 mod zed;
 
 // Ensure the binary name stays in sync with APP_NAME so that the paths used
