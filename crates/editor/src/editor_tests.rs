@@ -82,6 +82,27 @@ fn display_ranges(editor: &Editor, cx: &mut Context<'_, Editor>) -> Vec<Range<Di
         .display_ranges(&editor.display_snapshot(cx))
 }
 
+#[gpui::test]
+async fn newest_selection_head_resolves_to_the_current_cursor(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+    cx.set_state("ˇabcdef");
+    cx.update_editor(|editor, window, cx| {
+        editor.change_selections(Default::default(), window, cx, |selections| {
+            selections.select_ranges([MultiBufferOffset(4)..MultiBufferOffset(4)]);
+        });
+    });
+
+    let (head, snapshot) = cx.editor(|editor, _window, cx| {
+        (
+            editor.newest_selection_head(),
+            editor.buffer().read(cx).snapshot(cx),
+        )
+    });
+
+    assert_eq!(head.to_offset(&snapshot), MultiBufferOffset(4));
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub mod property_test;
 

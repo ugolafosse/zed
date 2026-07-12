@@ -1,6 +1,10 @@
 use super::*;
 
 impl Editor {
+    pub fn newest_selection_head(&self) -> Anchor {
+        self.selections.newest_anchor().head()
+    }
+
     pub fn sync_selections(
         &mut self,
         other: Entity<Editor>,
