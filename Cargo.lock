@@ -22514,6 +22514,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "workbench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assets",
+ "editor",
+ "gpui",
+ "language",
+ "release_channel",
+ "semver",
+ "settings",
+ "theme",
+ "theme_settings",
+ "vim",
+ "vim_mode_setting",
+]
+
+[[package]]
 name = "workspace"
 version = "0.1.0"
 dependencies = [
