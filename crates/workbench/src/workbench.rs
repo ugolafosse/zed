@@ -2,11 +2,13 @@
 use std::cell::Cell;
 #[cfg(test)]
 use std::path::Component;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 #[cfg(test)]
-use anyhow::{Result, bail};
+use anyhow::Result;
+#[cfg(test)]
+use anyhow::bail;
 #[cfg(test)]
 use assets::Assets;
 #[cfg(test)]
@@ -31,7 +33,91 @@ pub trait WorkbenchHost {
     fn open_collection(&self, request: OpenCollectionRequest);
 }
 
-fn initialize_collection_metadata(collection_root: &std::path::Path) -> anyhow::Result<()> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CollectionId(String);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceId(String);
+
+pub struct CollectionSource {
+    id: SourceId,
+    relative_path: PathBuf,
+}
+
+impl CollectionSource {
+    pub fn id(&self) -> &SourceId {
+        &self.id
+    }
+
+    pub fn relative_path(&self) -> &Path {
+        &self.relative_path
+    }
+}
+
+pub struct WorkbenchCollection {
+    id: CollectionId,
+    source: CollectionSource,
+}
+
+impl WorkbenchCollection {
+    pub fn open(collection_root: &Path) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            collection_root.is_dir(),
+            "Collection path is not a directory"
+        );
+        let relative_path = PathBuf::from("source.md");
+        anyhow::ensure!(
+            collection_root.join(&relative_path).is_file(),
+            "Collection source.md is not a file"
+        );
+
+        let connection = open_collection_metadata(collection_root)?;
+        let (collection_id, source_id) = connection.with_savepoint(
+            "load_workbench_collection_identity",
+            || -> anyhow::Result<(String, String)> {
+                let new_collection_id = uuid::Uuid::new_v4().to_string();
+                connection.exec_bound(
+                    "INSERT OR IGNORE INTO collection_identity (singleton, id) VALUES (1, ?)",
+                )?(new_collection_id)?;
+                let collection_id = connection.select_row::<String>(
+                    "SELECT id FROM collection_identity WHERE singleton = 1",
+                )?()?
+                .ok_or_else(|| anyhow::anyhow!("Collection identity was not initialized"))?;
+
+                let new_source_id = uuid::Uuid::new_v4().to_string();
+                connection.exec_bound(
+                    "INSERT OR IGNORE INTO sources (id, relative_path) VALUES (?, ?)",
+                )?((new_source_id, "source.md"))?;
+                let source_id = connection.select_row_bound::<&str, String>(
+                    "SELECT id FROM sources WHERE relative_path = ?",
+                )?("source.md")?
+                .ok_or_else(|| anyhow::anyhow!("Collection source identity was not initialized"))?;
+
+                Ok((collection_id, source_id))
+            },
+        )?;
+
+        Ok(Self {
+            id: CollectionId(collection_id),
+            source: CollectionSource {
+                id: SourceId(source_id),
+                relative_path,
+            },
+        })
+    }
+
+    pub fn id(&self) -> &CollectionId {
+        &self.id
+    }
+
+    pub fn source(&self) -> &CollectionSource {
+        &self.source
+    }
+}
+
+fn open_collection_metadata(
+    collection_root: &std::path::Path,
+) -> anyhow::Result<sqlez::connection::Connection> {
     let metadata_directory = collection_root.join(".workbench");
     std::fs::create_dir_all(&metadata_directory)?;
 
@@ -44,11 +130,24 @@ fn initialize_collection_metadata(collection_root: &std::path::Path) -> anyhow::
     );
     connection.migrate(
         "workbench_collection",
-        &["PRAGMA user_version = 1;"],
+        &[
+            "PRAGMA user_version = 1;",
+            r#"
+                CREATE TABLE collection_identity (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    id TEXT NOT NULL UNIQUE
+                );
+                CREATE TABLE sources (
+                    id TEXT PRIMARY KEY,
+                    relative_path TEXT NOT NULL UNIQUE
+                );
+                PRAGMA user_version = 2;
+            "#,
+        ],
         &mut |_, _, _| false,
     )?;
 
-    Ok(())
+    Ok(connection)
 }
 
 pub fn init_workbench_capability(host: Rc<dyn WorkbenchHost>, cx: &mut App) {
@@ -67,17 +166,16 @@ pub fn init_workbench_capability(host: Rc<dyn WorkbenchHost>, cx: &mut App) {
             let Some(collection_root) = paths.into_iter().next() else {
                 return;
             };
-            let source = collection_root.join("source.md");
-            if !collection_root.is_dir() || !source.is_file() {
-                return;
-            }
-            if let Err(error) = initialize_collection_metadata(&collection_root) {
-                log::error!("failed to initialize Workbench Collection metadata: {error:#}");
-                return;
-            }
+            let collection = match WorkbenchCollection::open(&collection_root) {
+                Ok(collection) => collection,
+                Err(error) => {
+                    log::error!("failed to open Workbench Collection: {error:#}");
+                    return;
+                }
+            };
             host.open_collection(OpenCollectionRequest {
+                source: collection_root.join(collection.source().relative_path()),
                 collection_root,
-                source,
             });
         })
         .detach();
@@ -376,6 +474,38 @@ mod tests {
                 .join(".workbench/collection.sqlite")
                 .is_file(),
             "opening should initialize portable Collection metadata"
+        );
+    }
+
+    #[test]
+    fn collection_identity_survives_relocating_its_directory() {
+        let parent = tempfile::tempdir().expect("temporary parent should be created");
+        let original_root = parent.path().join("collection");
+        std::fs::create_dir(&original_root).expect("Collection directory should be created");
+        std::fs::write(original_root.join("source.md"), "# Source")
+            .expect("Collection source should be written");
+
+        let original = super::WorkbenchCollection::open(&original_root)
+            .expect("portable Collection should open");
+        let collection_id = original.id().clone();
+        let source_id = original.source().id().clone();
+        assert_eq!(
+            original.source().relative_path(),
+            std::path::Path::new("source.md")
+        );
+        drop(original);
+
+        let relocated_root = parent.path().join("renamed-collection");
+        std::fs::rename(&original_root, &relocated_root)
+            .expect("entire Collection should relocate");
+        let relocated = super::WorkbenchCollection::open(&relocated_root)
+            .expect("relocated Collection should reopen");
+
+        assert_eq!(relocated.id(), &collection_id);
+        assert_eq!(relocated.source().id(), &source_id);
+        assert_eq!(
+            relocated.source().relative_path(),
+            std::path::Path::new("source.md")
         );
     }
 }

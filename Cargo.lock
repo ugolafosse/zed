@@ -22530,6 +22530,7 @@ dependencies = [
  "tempfile",
  "theme",
  "theme_settings",
+ "uuid",
  "vim",
 ]
 
