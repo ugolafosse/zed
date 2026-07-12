@@ -13,10 +13,12 @@ path = "src/workbench.rs"
 doctest = false
 
 [dependencies]
+anyhow.workspace = true
 gpui.workspace = true
+log.workspace = true
+sqlez.workspace = true
 
 [dev-dependencies]
-anyhow.workspace = true
 assets.workspace = true
 editor.workspace = true
 gpui = { workspace = true, features = ["test-support"] }

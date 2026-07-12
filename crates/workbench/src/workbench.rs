@@ -31,6 +31,26 @@ pub trait WorkbenchHost {
     fn open_collection(&self, request: OpenCollectionRequest);
 }
 
+fn initialize_collection_metadata(collection_root: &std::path::Path) -> anyhow::Result<()> {
+    let metadata_directory = collection_root.join(".workbench");
+    std::fs::create_dir_all(&metadata_directory)?;
+
+    let metadata_path = metadata_directory.join("collection.sqlite");
+    let connection = sqlez::connection::Connection::open_file(&metadata_path.to_string_lossy());
+    anyhow::ensure!(
+        connection.persistent(),
+        "failed to open portable Collection metadata at {}",
+        metadata_path.display()
+    );
+    connection.migrate(
+        "workbench_collection",
+        &["PRAGMA user_version = 1;"],
+        &mut |_, _, _| false,
+    )?;
+
+    Ok(())
+}
+
 pub fn init_workbench_capability(host: Rc<dyn WorkbenchHost>, cx: &mut App) {
     cx.on_action(move |_: &OpenCollection, cx| {
         let prompt = cx.prompt_for_paths(PathPromptOptions {
@@ -49,6 +69,10 @@ pub fn init_workbench_capability(host: Rc<dyn WorkbenchHost>, cx: &mut App) {
             };
             let source = collection_root.join("source.md");
             if !collection_root.is_dir() || !source.is_file() {
+                return;
+            }
+            if let Err(error) = initialize_collection_metadata(&collection_root) {
+                log::error!("failed to initialize Workbench Collection metadata: {error:#}");
                 return;
             }
             host.open_collection(OpenCollectionRequest {
@@ -296,6 +320,62 @@ mod tests {
                 collection_root: collection.path().to_path_buf(),
                 source: collection.path().join("source.md"),
             })
+        );
+    }
+
+    #[gpui::test]
+    async fn opening_a_collection_initializes_portable_metadata_before_host_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::{cell::Cell, rc::Rc};
+
+        struct RecordingHost {
+            opened: Cell<bool>,
+            metadata_existed_when_opened: Cell<bool>,
+        }
+
+        impl super::WorkbenchHost for RecordingHost {
+            fn open_collection(&self, request: super::OpenCollectionRequest) {
+                self.metadata_existed_when_opened.set(
+                    request
+                        .collection_root
+                        .join(".workbench/collection.sqlite")
+                        .is_file(),
+                );
+                self.opened.set(true);
+            }
+        }
+
+        let collection = tempfile::tempdir().expect("temporary Collection should be created");
+        std::fs::write(collection.path().join("source.md"), "# Source")
+            .expect("Collection source should be written");
+        let host = Rc::new(RecordingHost {
+            opened: Cell::new(false),
+            metadata_existed_when_opened: Cell::new(false),
+        });
+
+        cx.update(|cx| super::init_workbench_capability(host.clone(), cx));
+        cx.update(|cx| cx.dispatch_action(&super::OpenCollection));
+        cx.simulate_path_prompt_response({
+            let selected = collection.path().to_path_buf();
+            move |_options| Some(vec![selected])
+        });
+        cx.run_until_parked();
+
+        assert!(
+            host.opened.get(),
+            "selected Collection should reach the host"
+        );
+        assert!(
+            host.metadata_existed_when_opened.get(),
+            "portable Collection metadata should exist before host open"
+        );
+        assert!(
+            collection
+                .path()
+                .join(".workbench/collection.sqlite")
+                .is_file(),
+            "opening should initialize portable Collection metadata"
         );
     }
 }
