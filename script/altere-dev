@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "$0")/.." && pwd)
+app_bundle="$repo_root/target/debug/Altere Zed.app"
+app_binary="$app_bundle/Contents/MacOS/zed"
+zed_binary="$repo_root/target/debug/zed"
+cli_binary="$repo_root/target/debug/cli"
+collection=${1:-/Users/ugo/_nexus/mind/myaltere}
+data_dir=${ALTERE_ZED_DATA_DIR:-$HOME/.cache/altere/zed-dev}
+runtime=${ALTERE_RUNTIME:-/Users/ugo/_nexus/altere/packages/intermittent-reading/bin/ir.ts}
+
+stop_altere_zed() {
+  local pid command
+  while read -r pid command; do
+    case "$command" in
+      "$app_binary"|"$zed_binary"|"$cli_binary")
+        kill "$pid" 2>/dev/null || continue
+        while kill -0 "$pid" 2>/dev/null; do sleep 0.05; done
+        ;;
+    esac
+  done < <(ps -axo pid=,comm=)
+}
+
+stop_altere_zed
+
+if [[ ${ALTERE_SKIP_BUILD:-0} != 1 ]]; then
+  (cd "$repo_root" && cargo build -p zed -p cli --no-default-features)
+fi
+
+if [[ ! -x "$app_binary" ]]; then
+  echo "Missing Altere Zed app wrapper: $app_binary" >&2
+  exit 1
+fi
+
+mkdir -p "$data_dir/config"
+ln -sfn "$HOME/.config/zed/settings.json" "$data_dir/config/settings.json"
+
+runtime_env=(
+  env
+  ALTERE_MODE=1
+  "ALTERE_ATTENTION_MODE=${ALTERE_ATTENTION_MODE:-guided}"
+  "ALTERE_BUN=${ALTERE_BUN:-$HOME/.bun/bin/bun}"
+  "ALTERE_RUNTIME=$runtime"
+  "ALTERE_COLLECTION=$collection"
+  "ALTERE_ANNOTATION_AGENT=${ALTERE_ANNOTATION_AGENT:-altere-acp-spike}"
+)
+
+# A fresh persistent data directory records first-open during Onboarding but does
+# not open the requested project until the following launch. Prime it once, then
+# immediately start the real session. Stateless mode must never be used here.
+if [[ ! -d "$data_dir/db" ]]; then
+  "${runtime_env[@]}" "$app_binary" --user-data-dir "$data_dir" \
+    >"$data_dir/bootstrap.log" 2>&1 &
+  bootstrap_pid=$!
+  for _ in {1..100}; do
+    [[ -d "$data_dir/db" ]] && break
+    sleep 0.05
+  done
+  sleep 0.5
+  kill "$bootstrap_pid" 2>/dev/null || true
+  wait "$bootstrap_pid" 2>/dev/null || true
+fi
+
+echo "Altere Zed · $(git -C "$repo_root" rev-parse --short HEAD)"
+echo "Collection · $collection"
+echo "Data dir · $data_dir"
+exec "${runtime_env[@]}" "$cli_binary" \
+  --foreground \
+  "--zed=$app_bundle" \
+  --user-data-dir "$data_dir" \
+  "$collection"

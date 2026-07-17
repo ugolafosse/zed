@@ -65,6 +65,7 @@ required-features = ["visual-tests"]
 [dependencies]
 acp_tools.workspace = true
 activity_indicator.workspace = true
+altere_ui.workspace = true
 agent.workspace = true
 agent-client-protocol.workspace = true
 agent_settings.workspace = true
@@ -87,6 +88,7 @@ codestral.workspace = true
 collab_ui.workspace = true
 collections.workspace = true
 command_palette.workspace = true
+command_palette_hooks.workspace = true
 component.workspace = true
 component_preview.workspace = true
 copilot.workspace = true

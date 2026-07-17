@@ -1,0 +1,20 @@
+[package]
+name = "altere_ui"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/altere_ui.rs"
+
+[features]
+default = []
+
+[dependencies]
+component.workspace = true
+gpui.workspace = true
+ui.workspace = true

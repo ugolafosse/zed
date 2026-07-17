@@ -35,6 +35,10 @@
 //!   UPDATE_BASELINE - Set to update baseline images instead of comparing
 //!   VISUAL_TEST_OUTPUT_DIR - Directory to save test output (default: target/visual_tests)
 
+#[cfg(target_os = "macos")]
+#[path = "zed/altere_workbench/next_button.rs"]
+mod altere_next_button;
+
 // Stub main for non-macOS platforms
 #[cfg(not(target_os = "macos"))]
 fn main() {
@@ -246,6 +250,11 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
 
     // Run until all initialization tasks complete
     cx.run_until_parked();
+
+    if std::env::var("VISUAL_TEST_FILTER").as_deref() == Ok("altere_next_repetition") {
+        run_altere_next_repetition_visual_test(&mut cx, update_baseline)?;
+        return Ok(());
+    }
 
     // Open workspace window
     let window_size = size(px(1280.0), px(800.0));
@@ -672,6 +681,59 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         println!("\n=== All Visual Tests PASSED ===");
         Ok(())
     }
+}
+
+#[cfg(target_os = "macos")]
+struct AltereNextRepetitionTestView {
+    button: Entity<altere_next_button::AltereNextButton>,
+}
+
+#[cfg(target_os = "macos")]
+impl gpui::Render for AltereNextRepetitionTestView {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        use ui::prelude::*;
+
+        h_flex()
+            .size_full()
+            .justify_center()
+            .bg(cx.theme().colors().status_bar_background)
+            .child(self.button.clone())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_altere_next_repetition_visual_test(
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Result<TestResult> {
+    let bounds = Bounds {
+        origin: point(px(0.), px(0.)),
+        size: size(px(320.), px(72.)),
+    };
+    let window = cx.update(|cx| {
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                focus: false,
+                show: false,
+                ..Default::default()
+            },
+            |_window, cx| {
+                let button = altere_next_button::next_button(cx);
+                cx.new(|_| AltereNextRepetitionTestView { button })
+            },
+        )
+    })?;
+
+    cx.run_until_parked();
+    let result = run_visual_test("altere_next_repetition", window.into(), cx, update_baseline)?;
+    cx.update_window(window.into(), |_, window, _cx| window.remove_window())?;
+    cx.run_until_parked();
+    Ok(result)
 }
 
 #[cfg(target_os = "macos")]

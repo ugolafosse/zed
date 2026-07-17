@@ -37,8 +37,8 @@ use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFon
 
 use crate::markdown_preview_settings::MarkdownPreviewSettings;
 use crate::{
-    CloseAndReturnToEditor, OpenFollowingPreview, OpenPreview, OpenPreviewToTheSide, ScrollDown,
-    ScrollDownByItem,
+    CloseAndReturnToEditor, OpenFollowingPreview, OpenFollowingPreviewToTheSide, OpenPreview,
+    OpenPreviewToTheSide, ScrollDown, ScrollDownByItem,
 };
 use crate::{ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, ScrollUp, ScrollUpByItem};
 
@@ -162,6 +162,46 @@ impl MarkdownPreviewView {
                 cx.notify();
             }
         });
+
+        workspace.register_action(
+            move |workspace, _: &OpenFollowingPreviewToTheSide, window, cx| {
+                Self::open_following_preview_to_the_side(workspace, window, cx);
+            },
+        );
+    }
+
+    pub fn open_following_preview_to_the_side(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Some(editor) = Self::resolve_active_item_as_markdown_editor(workspace, cx) else {
+            return;
+        };
+        let existing_view = workspace
+            .items_of_type::<MarkdownPreviewView>(cx)
+            .find(|view| view.read(cx).mode == MarkdownPreviewMode::Follow);
+
+        if let Some(existing_view) = existing_view {
+            workspace.activate_item(&existing_view, false, false, window, cx);
+        } else {
+            let view = Self::create_following_markdown_view(workspace, editor.clone(), window, cx);
+            let pane = workspace
+                .find_pane_in_direction(workspace::SplitDirection::Right, cx)
+                .unwrap_or_else(|| {
+                    workspace.split_pane(
+                        workspace.active_pane().clone(),
+                        workspace::SplitDirection::Right,
+                        window,
+                        cx,
+                    )
+                });
+            pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(view), false, false, None, window, cx)
+            });
+        }
+        editor.focus_handle(cx).focus(window, cx);
+        cx.notify();
     }
 
     fn find_existing_independent_preview_item_idx(
@@ -2272,6 +2312,141 @@ mod tests {
             PathBuf::from(path!("/dir/b.md")),
             "a Follow preview should persist the source editor it most recently followed"
         );
+    }
+
+    #[gpui::test]
+    async fn following_preview_to_the_side_tracks_active_markdown_editor(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        app_state.languages.add(language::markdown_lang());
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/dir"),
+                json!({
+                    "a.md": "# A\n",
+                    "b.md": "# B\n",
+                }),
+            )
+            .await;
+
+        cx.update(|cx| {
+            open_paths(
+                &[PathBuf::from(path!("/dir"))],
+                app_state.clone(),
+                workspace::OpenOptions::default(),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+        let multi_workspace = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
+        let worktree_id = multi_workspace
+            .update(cx, |multi_workspace, _, cx| {
+                multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .project()
+                    .read(cx)
+                    .worktrees(cx)
+                    .next()
+                    .unwrap()
+                    .read(cx)
+                    .id()
+            })
+            .unwrap();
+
+        let opened_item = multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    workspace.open_path((worktree_id, rel_path("a.md")), None, true, window, cx)
+                })
+            })
+            .unwrap()
+            .await
+            .unwrap();
+        let editor_a = cx.update(|cx| opened_item.act_as::<Editor>(cx).unwrap());
+        cx.run_until_parked();
+
+        multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    MarkdownPreviewView::open_following_preview_to_the_side(workspace, window, cx);
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let preview = multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().read(cx);
+                let previews = workspace
+                    .items_of_type::<MarkdownPreviewView>(cx)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    (workspace.panes().len(), previews.len()),
+                    (2, 1),
+                    "the action should create one following preview in a right-hand pane"
+                );
+                assert!(
+                    editor_a
+                        .read(cx)
+                        .focus_handle(cx)
+                        .contains_focused(window, cx)
+                );
+                previews[0].clone()
+            })
+            .unwrap();
+        assert_eq!(preview_source_path(cx, &preview).as_ref(), rel_path("a.md"));
+
+        let opened_item = multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    workspace.open_path((worktree_id, rel_path("b.md")), None, true, window, cx)
+                })
+            })
+            .unwrap()
+            .await
+            .unwrap();
+        let editor_b = cx.update(|cx| opened_item.act_as::<Editor>(cx).unwrap());
+        cx.run_until_parked();
+
+        assert_eq!(preview_source_path(cx, &preview).as_ref(), rel_path("b.md"));
+        multi_workspace
+            .update(cx, |_, window, cx| {
+                MarkdownPreviewView::change_selection_to_source_index(
+                    &editor_b, 3, true, window, cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            preview.read_with(cx, |preview, _| preview.active_source_index),
+            Some(3)
+        );
+
+        multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                assert!(
+                    editor_b
+                        .read(cx)
+                        .focus_handle(cx)
+                        .contains_focused(window, cx)
+                );
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    MarkdownPreviewView::open_following_preview_to_the_side(workspace, window, cx);
+                });
+                assert_eq!(
+                    multi_workspace
+                        .workspace()
+                        .read(cx)
+                        .items_of_type::<MarkdownPreviewView>(cx)
+                        .count(),
+                    1
+                );
+            })
+            .unwrap();
     }
 
     #[gpui::test]

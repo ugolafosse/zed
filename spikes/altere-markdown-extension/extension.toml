@@ -1,0 +1,19 @@
+id = "altere-markdown"
+name = "Altere Markdown"
+description = "Method-aware Markdown editing for the Altere Workbench."
+version = "0.0.1"
+schema_version = 1
+authors = ["Altere"]
+repository = "https://github.com/ugolafosse/altere"
+
+[language_servers.altere-language-server]
+name = "Altere Language Server"
+language = "Markdown"
+
+[language_servers.altere-language-server.language_ids]
+"Markdown" = "markdown"
+
+[[capabilities]]
+kind = "process:exec"
+command = "altere-language-server"
+args = ["--stdio"]

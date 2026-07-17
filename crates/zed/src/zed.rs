@@ -1,3 +1,4 @@
+mod altere_workbench;
 mod app_menus;
 pub mod edit_prediction_registry;
 #[cfg(target_os = "macos")]
@@ -17,6 +18,7 @@ pub(crate) mod windows_only_instance;
 
 use agent_settings::{UserAgentsMdState, init_user_agents_md};
 use agent_ui::AgentDiffToolbar;
+use altere_workbench::AltereMode;
 use anyhow::Context as _;
 pub use app_menus::*;
 use assets::Assets;
@@ -552,7 +554,10 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
 
         let workspace_handle = cx.entity();
         let center_pane = workspace.active_pane().clone();
+        let altere_mode = AltereMode::from_env();
+        altere_workbench::apply_capability_policy(altere_mode, cx);
         initialize_pane(workspace, &center_pane, window, cx);
+        altere_workbench::register_actions(altere_mode, workspace, window, cx);
 
         cx.subscribe_in(&workspace_handle, window, {
             move |workspace, _, event, window, cx| match event {
@@ -631,6 +636,9 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let git_blame_status = cx.new(|_| git_ui::GitBlameStatus::default());
         let merge_conflict_indicator =
             cx.new(|cx| git_ui::MergeConflictIndicator::new(workspace, cx));
+        let altere_next_button = altere_mode
+            .show_next_button()
+            .then(|| altere_workbench::next_button(cx));
         workspace.status_bar().update(cx, |status_bar, cx| {
             status_bar.add_left_item(search_button, window, cx);
             status_bar.add_left_item(lsp_button, window, cx);
@@ -639,7 +647,9 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_left_item(git_blame_status, window, cx);
             status_bar.add_left_item(merge_conflict_indicator, window, cx);
             status_bar.add_left_item(activity_indicator, window, cx);
-            status_bar.add_right_item(edit_prediction_ui, window, cx);
+            if altere_mode.show_edit_prediction() {
+                status_bar.add_right_item(edit_prediction_ui, window, cx);
+            }
             status_bar.add_right_item(active_buffer_encoding, window, cx);
             status_bar.add_right_item(active_buffer_language, window, cx);
             status_bar.add_right_item(active_toolchain_language, window, cx);
@@ -647,9 +657,12 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_right_item(vim_mode_indicator, window, cx);
             status_bar.add_right_item(cursor_position, window, cx);
             status_bar.add_right_item(image_info, window, cx);
+            if let Some(altere_next_button) = altere_next_button {
+                status_bar.add_right_item(altere_next_button, window, cx);
+            }
         });
 
-        let panels_task = initialize_panels(window, cx);
+        let panels_task = initialize_panels(altere_mode, window, cx);
         workspace.set_panels_task(panels_task);
         register_actions(app_state.clone(), workspace, window, cx);
 
@@ -772,7 +785,11 @@ fn show_software_emulation_warning_if_needed(
     }
 }
 
-fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<anyhow::Result<()>> {
+fn initialize_panels(
+    altere_mode: AltereMode,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Task<anyhow::Result<()>> {
     cx.spawn_in(window, async move |workspace_handle, cx| {
         let project_panel = ProjectPanel::load(workspace_handle.clone(), cx.clone());
         let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
@@ -781,12 +798,24 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         let channels_panel =
             collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
+        let priority_queue_panel = altere_workbench::AlterePriorityQueuePanel::load(
+            workspace_handle.clone(),
+            cx.clone(),
+        );
+        let knowledge_tree_panel = altere_workbench::AltereKnowledgeTreePanel::load(
+            workspace_handle.clone(),
+            cx.clone(),
+        );
 
         async fn add_panel_when_ready(
+            enabled: bool,
             panel_task: impl Future<Output = anyhow::Result<Entity<impl workspace::Panel>>> + 'static,
             workspace_handle: WeakEntity<Workspace>,
             mut cx: gpui::AsyncWindowContext,
         ) {
+            if !enabled {
+                return;
+            }
             if let Some(panel) = panel_task.await.context("failed to load panel").log_err()
             {
                 workspace_handle
@@ -798,12 +827,39 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         }
 
         futures::join!(
-            add_panel_when_ready(project_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(terminal_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(true, project_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(true, outline_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(
+                altere_mode.show_terminal(),
+                terminal_panel,
+                workspace_handle.clone(),
+                cx.clone()
+            ),
+            add_panel_when_ready(true, git_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(
+                altere_mode.show_collaboration(),
+                channels_panel,
+                workspace_handle.clone(),
+                cx.clone()
+            ),
+            add_panel_when_ready(
+                altere_mode.show_debugger(),
+                debug_panel,
+                workspace_handle.clone(),
+                cx.clone()
+            ),
+            add_panel_when_ready(
+                altere_mode.show_priority_queue(),
+                priority_queue_panel,
+                workspace_handle.clone(),
+                cx.clone()
+            ),
+            add_panel_when_ready(
+                altere_mode.show_knowledge_tree(),
+                knowledge_tree_panel,
+                workspace_handle.clone(),
+                cx.clone()
+            ),
             initialize_agent_panel(workspace_handle, cx.clone()).map(|r| r.log_err()),
         );
 
@@ -1460,6 +1516,17 @@ fn initialize_pane(
             toolbar.add_item(commit_view_toolbar, window, cx);
             let agent_diff_toolbar = cx.new(AgentDiffToolbar::new);
             toolbar.add_item(agent_diff_toolbar, window, cx);
+            let altere_mode = AltereMode::from_env();
+            if altere_mode.keep_markdown_preview_open() {
+                let markdown_preview_toolbar =
+                    cx.new(altere_workbench::AltereMarkdownPreviewToolbar::new);
+                toolbar.add_item(markdown_preview_toolbar, window, cx);
+            }
+            if altere_mode.show_next_button() {
+                let proposal_review_toolbar =
+                    cx.new(altere_workbench::AltereProposalReviewToolbar::new);
+                toolbar.add_item(proposal_review_toolbar, window, cx);
+            }
             let basedpyright_banner = cx.new(|cx| BasedPyrightBanner::new(workspace, cx));
             toolbar.add_item(basedpyright_banner, window, cx);
             let image_view_toolbar = cx.new(|_| image_viewer::ImageViewToolbarControls::new());
@@ -2317,6 +2384,8 @@ pub fn load_default_keymap(cx: &mut App) {
             cx,
         ));
     }
+
+    cx.bind_keys(altere_workbench::key_bindings());
 
     cx.bind_keys(
         KeymapFile::load_asset(
